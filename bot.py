@@ -10,13 +10,19 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 DB_PATH = "reels.db"
 MODEL = "claude-haiku-4-5-20251001"
-CATEGORIES = ["개발/AI", "공부/자격증", "일본어/취업", "운동/건강", "요리", "돈/재테크",
-              "여행/맛집", "게임/축구", "SNS/마케팅", "기타"]
+CATEGORIES = ["개발/AI", "요리", "자기계발", "경제/재테크", "운동", "여행", "공부", "패션", "제품 리뷰", "뉴스/정보", "기타/정보"]
+TEMPLATES = {  # 카테고리별 노트 지침: 프롬프트에 그대로 들어간다
+    "개발/AI": "핵심=동작 원리·구현 방식·시간복잡도·활용 / 용어=언어·알고리즘·API / 질문=다른 방식과 비교·코드 구현·면접·실무 / 해볼것=예제 코드 작성·직접 실행 / 시간=예상 학습 시간",
+    "요리": "핵심=재료·손질·양념 순서·불 조절 / 용어=조리 용어 / 질문=재료 대체·초보 주의점·칼로리·인분 / 해볼것=직접 만들어보기 / 시간=예상 조리 시간 / recipe에 재료와 조리 순서",
+    "자기계발": "핵심=실행 단계 / 용어=우선순위·집중 시간 등 / 질문=내 상황 적용·계획 수정 / 해볼것=실제 생활에 적용 / 시간=예상 소요 시간",
+    "경제/재테크": "핵심=영상이 설명한 개념·주장·핵심 숫자·주의점(객관적으로, 투자 조언 금지) / 용어=고정비·복리 등 / 질문=쉬운 설명·생활 적용·다른 방법과 차이 / 해볼것=내 지출·예산에 적용 / 시간=예상 소요 시간",
+    "운동": "핵심=동작·자세·횟수 / 해볼것=동작 따라하기", "여행": "핵심=장소·동선·팁 / 해볼것=일정 만들어보기", "공부": "핵심=개념·공식 / 해볼것=문제 풀기·복습",
+}
 URL_RE = re.compile(r"https?://(?:www\.)?instagram\.com/\S+")
 OWNER_ID = int(os.environ["TELEGRAM_OWNER_ID"]) if os.environ.get("TELEGRAM_OWNER_ID") else None
 WEB_BASE = os.environ.get("WEB_BASE", "http://localhost:8000")
 llm = anthropic.Anthropic()
-EMPTY = {"category": "기타", "title": "", "summary": "", "key_points": [], "steps": [], "tags": [], "concepts": [], "questions": []}
+EMPTY = {"category": "기타/정보", "title": "", "summary": "", "one_liner": "", "topic": "", "difficulty": "", "time_label": "예상 소요 시간", "time_value": "", "key_points": [], "concepts": [], "questions": [], "steps": [], "tags": [], "recipe": None}
 
 
 def db_run(sql, params=(), fetch=False):
@@ -49,12 +55,13 @@ def fetch_reel(url):
     opts = {"quiet": True, "format": "bestaudio/best", "outtmpl": f"{tmp}/%(id)s.%(ext)s"}
     if os.environ.get("IG_COOKIES"):  # 선택: 로그인 쿠키 파일(cookies.txt) 경로
         opts["cookiefile"] = os.environ["IG_COOKIES"]
-    caption = author = transcript = ""
+    caption = author = transcript = thumb = ""
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
         caption = info.get("description") or info.get("title") or ""
         author = info.get("uploader") or ""
+        thumb = info.get("thumbnail") or ""
         files = glob.glob(f"{tmp}/*")
         if files:
             if _whisper is None:
@@ -66,29 +73,44 @@ def fetch_reel(url):
         print("fetch/전사 오류:", e)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    return caption, author, transcript
+    return caption, author, transcript, thumb
 
 
 def analyze(text, transcript=""):
     """캡션/메모/영상 전사문을 학습 노트(dict)로 정리한다."""
     if not (text.strip() or transcript.strip()):
         return dict(EMPTY)
-    prompt = (f"인스타그램 릴스의 캡션/메모와 음성 전사문입니다(영어 강의일 수 있음).\n[캡션/메모]\n{text[:2000]}\n"
-              f"[전사문]\n{transcript[:12000]}\n---\n카테고리 목록: {CATEGORIES}\n"
-              "한국어 공부 노트로 정리해 JSON으로만 답하세요. 전문용어는 영어 원문을 병기하세요:\n"
-              '{"category":"목록 중 하나","title":"20자 내외 제목","summary":"핵심 내용 6~10문장",'
-              '"key_points":["핵심 3~6개"],"concepts":[{"term":"용어","explain":"초보자용 설명 1~2문장"}],'
-              '"steps":["직접 해볼 행동 0~4개"],"questions":["AI에게 더 물어볼 질문 3개"],"tags":["키워드 3~5개"]}\n'
-              "내용에 없는 것은 지어내지 마세요. 화면으로만 보여준 코드/도식은 전사문에 없으니, 정보가 부족하면 summary에 그렇게 적으세요.")
+    guide = "\n".join(f"- {k}: {v}" for k, v in TEMPLATES.items())
+    prompt = (f"인스타그램 릴스의 캡션/메모와 음성 전사문입니다(영어일 수 있음).\n[캡션/메모]\n{text[:2000]}\n[전사문]\n{transcript[:12000]}\n---\n"
+              f"1) 카테고리 목록 {CATEGORIES} 중 하나를 고르고 2) 그 카테고리 지침에 맞춰 한국어 학습 노트를 JSON으로만 답하세요. 전문용어는 영어 병기.\n지침:\n{guide}\n"
+              '{"category":"","title":"20자 내외","summary":"6~10문장","one_liner":"한 줄 요약 1문장","topic":"주제 (2개 이내, · 로 구분)",'
+              '"difficulty":"초급|중급|고급","time_label":"예상 학습 시간|예상 조리 시간|예상 소요 시간","time_value":"약 N분",'
+              '"key_points":[{"title":"짧은 제목","desc":"1~2문장"}] 3~5개(릴스에서 나온 내용만),'
+              '"concepts":[{"term":"","explain":"","source":"reel 또는 ai"}] 3~5개(릴스에 언급됐으면 reel, 이해를 돕기 위해 추가했으면 ai),'
+              '"questions":["3개"],"steps":["구체적으로 실행 가능한 행동 3~4개"],"tags":["3~5개"],'
+              '"recipe":null 또는 {"ingredients":["재료"],"order":["조리 순서"]}(요리만)}\n'
+              "내용에 없는 것은 key_points에 넣지 마세요. 경제/재테크는 투자 조언처럼 쓰지 마세요. 화면으로만 보인 코드/도식은 전사문에 없으니 정보가 부족하면 summary에 그렇게 적으세요.")
     try:
-        res = llm.messages.create(model=MODEL, max_tokens=2000, messages=[{"role": "user", "content": prompt}])
+        res = llm.messages.create(model=MODEL, max_tokens=3000, messages=[{"role": "user", "content": prompt}])
         data = json.loads(re.search(r"\{.*\}", res.content[0].text, re.S).group())
         if data.get("category") not in CATEGORIES:
-            data["category"] = "기타"
+            data["category"] = "기타/정보"
         return {**EMPTY, **data}
     except Exception as e:
         print("analyze 오류:", e)
         return dict(EMPTY)
+
+
+def save_reel(url, memo=""):
+    """수집 → 분석 → 저장. 봇과 웹이 함께 쓴다. (id, info, 내용이 비었는지) 반환"""
+    caption, author, transcript, thumb = fetch_reel(url)
+    full = f"{caption}\n{memo}".strip()
+    info = analyze(full, transcript)
+    info["thumbnail"] = thumb
+    db_run("INSERT INTO reels (url,author,caption,transcript,category,title,summary,details) VALUES (?,?,?,?,?,?,?,?)",
+           (url, author, full, transcript, info["category"], info["title"], info["summary"], json.dumps(info, ensure_ascii=False)))
+    rid = db_run("SELECT id FROM reels WHERE url=?", (url,), fetch=True)[0]["id"]
+    return rid, info, not (full or transcript)
 
 
 def allowed(update):
@@ -112,13 +134,8 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             continue
         if i:
             await asyncio.sleep(2)  # 연속 요청 차단 방지
-        caption, author, transcript = await asyncio.to_thread(fetch_reel, url)
-        full = f"{caption}\n{memo}".strip()
-        info = await asyncio.to_thread(analyze, full, transcript)
-        db_run("INSERT INTO reels (url,author,caption,transcript,category,title,summary,details) VALUES (?,?,?,?,?,?,?,?)",
-               (url, author, full, transcript, info["category"], info["title"], info["summary"], json.dumps(info, ensure_ascii=False)))
-        rid = db_run("SELECT id FROM reels WHERE url=?", (url,), fetch=True)[0]["id"]
-        note = "" if (full or transcript) else f"\n내용을 못 가져왔어요. /memo {rid} 한 줄 메모"
+        rid, info, empty = await asyncio.to_thread(save_reel, url, memo)
+        note = f"\n내용을 못 가져왔어요. /memo {rid} 한 줄 메모" if empty else ""
         out.append(f"#{rid} [{info['category']}] {info['title']}\n{WEB_BASE}/#/reel/{rid}{note}")
     await update.message.reply_text("\n\n".join(out))
 
@@ -136,6 +153,8 @@ async def cmd_memo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     full = f"{rows[0]['caption'] or ''}\n{memo}".strip()
     info = await asyncio.to_thread(analyze, full, rows[0]["transcript"] or "")
+    old = json.loads(db_run("SELECT details FROM reels WHERE id=?", (rid,), fetch=True)[0]["details"] or "{}")
+    info["thumbnail"] = old.get("thumbnail", "")
     db_run("UPDATE reels SET caption=?,category=?,title=?,summary=?,details=? WHERE id=?",
            (full, info["category"], info["title"], info["summary"], json.dumps(info, ensure_ascii=False), rid))
     await update.message.reply_text(f"#{rid} 다시 정리 → [{info['category']}] {info['title']}\n{WEB_BASE}/#/reel/{rid}")
