@@ -62,7 +62,7 @@ def index():
 
 
 PAGE = """<!doctype html><html lang="ko"><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Reels Note</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>릴스 노트</title>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+KR:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
 :root{--bg:#F2F4F1;--ink:#1B2430;--mute:#5F6B7A;--line:#D9DEE4}
@@ -87,6 +87,10 @@ li{margin-bottom:6px}
 .tags span{display:inline-block;margin:0 8px 4px 0;color:var(--mute);font-size:14px}
 .acts{display:flex;gap:8px;margin-top:24px}
 .back{color:var(--mute);text-decoration:none}
+dt{font-weight:700;margin-top:8px}dd{margin:0 0 6px;color:var(--mute)}
+.q{display:block;width:100%;text-align:left;border-radius:6px;margin-bottom:6px}
+.q.ok::after{content:" (복사됨)";color:var(--mute)}
+details{margin-top:20px;color:var(--mute)}
 .empty{color:var(--mute);margin-top:40px}
 </style>
 <main id="app"></main>
@@ -111,13 +115,17 @@ async function detail(id){
   app.innerHTML=`<a class="back" href="#/">← 목록</a><p class="cat" style="--c:${col(c)}">${esc(c)}</p><h1>${esc(r.title||'제목 없음')}</h1>
   <p class="sum">${esc(d.summary||r.summary||'요약이 아직 없어요. 텔레그램에서 /memo '+r.id+' 메모 로 내용을 추가해 보세요.')}</p>
   ${(d.key_points||[]).length?'<h3>핵심 정리</h3><ul>'+d.key_points.map(x=>`<li>${esc(x)}</li>`).join('')+'</ul>':''}
+  ${(d.concepts||[]).length?'<h3>용어 풀이</h3><dl>'+d.concepts.map(x=>`<dt>${esc(x.term)}</dt><dd>${esc(x.explain)}</dd>`).join('')+'</dl>':''}
+  ${(d.questions||[]).length?'<h3>AI에게 물어볼 질문 (누르면 복사)</h3>'+d.questions.map(x=>`<button class="q" data-q="${esc(x)}">${esc(x)}</button>`).join(''):''}
   ${(d.steps||[]).length?'<h3>해볼 것</h3>'+d.steps.map((x,i)=>`<label class="step"><input type="checkbox" data-i="${i}" ${done.includes(i)?'checked':''}> ${esc(x)}</label>`).join(''):''}
   <p class="tags">${(d.tags||[]).map(t=>`<span>#${esc(t)}</span>`).join('')}</p>
+  ${r.transcript?'<details><summary>영상 원문 스크립트</summary><p>'+esc(r.transcript)+'</p></details>':''}
   <div class="acts"><a class="btn" href="${esc(r.url)}" target="_blank" rel="noopener">원본 릴스 보기</a>
   <button class="btn pri" id="dn">${r.status=='done'?'안 본 것으로 되돌리기':'다 봤어요'}</button></div>
   ${r.related.length?'<h3>같이 보면 좋은 저장 릴스</h3>'+r.related.map(x=>`<a class="card" style="--c:${col(x.category||'기타')}" href="#/reel/${x.id}"><b>${esc(x.title||x.summary||'제목 없음')}</b></a>`).join(''):''}`;
   app.querySelectorAll('.step input').forEach(i=>i.onchange=()=>{
     const s=[...app.querySelectorAll('.step input')].flatMap((e,n)=>e.checked?[n]:[]);localStorage.setItem(k,JSON.stringify(s))});
+  app.querySelectorAll('.q').forEach(b=>b.onclick=()=>{navigator.clipboard.writeText(b.dataset.q);b.classList.add('ok')});
   document.getElementById('dn').onclick=async()=>{await api(`/api/reels/${id}/toggle`,{method:'POST'});detail(id)};
 }
 function route(){const m=location.hash.match(/reel\\/(\\d+)/);scrollTo(0,0);m?detail(m[1]):list()}

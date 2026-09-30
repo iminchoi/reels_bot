@@ -3,3 +3,4 @@ anthropic
 yt-dlp
 fastapi
 uvicorn
+faster-whisper

@@ -1,7 +1,7 @@
 """릴스 노트 봇: 링크(여러 개 가능) → 캡션 수집 → Claude가 학습 노트로 정리 → SQLite 저장.
 환경변수: TELEGRAM_TOKEN, ANTHROPIC_API_KEY, TELEGRAM_OWNER_ID(권장), WEB_BASE(선택, 기본 http://localhost:8000)
 """
-import asyncio, json, os, re, sqlite3
+import asyncio, glob, json, os, re, shutil, sqlite3, tempfile
 from contextlib import closing
 
 import anthropic, yt_dlp
@@ -16,7 +16,7 @@ URL_RE = re.compile(r"https?://(?:www\.)?instagram\.com/\S+")
 OWNER_ID = int(os.environ["TELEGRAM_OWNER_ID"]) if os.environ.get("TELEGRAM_OWNER_ID") else None
 WEB_BASE = os.environ.get("WEB_BASE", "http://localhost:8000")
 llm = anthropic.Anthropic()
-EMPTY = {"category": "기타", "title": "", "summary": "", "key_points": [], "steps": [], "tags": []}
+EMPTY = {"category": "기타", "title": "", "summary": "", "key_points": [], "steps": [], "tags": [], "concepts": [], "questions": []}
 
 
 def db_run(sql, params=(), fetch=False):
@@ -34,32 +34,54 @@ def init_db():
         category TEXT, summary TEXT, status TEXT NOT NULL DEFAULT 'todo',
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, done_at TEXT)""")
     cols = {r["name"] for r in db_run("PRAGMA table_info(reels)", fetch=True)}
-    for c in ("title", "details"):  # 기존 DB 업그레이드
+    for c in ("title", "details", "transcript"):  # 기존 DB 업그레이드
         if c not in cols:
             db_run(f"ALTER TABLE reels ADD COLUMN {c} TEXT")
 
 
-def fetch_meta(url):
+_whisper = None
+
+
+def fetch_reel(url):
+    """캡션, 작성자, 음성 전사문을 가져온다. 요청 한 번으로 오디오까지 받아 차단 위험을 줄인다."""
+    global _whisper
+    tmp = tempfile.mkdtemp()
+    opts = {"quiet": True, "format": "bestaudio/best", "outtmpl": f"{tmp}/%(id)s.%(ext)s"}
+    if os.environ.get("IG_COOKIES"):  # 선택: 로그인 쿠키 파일(cookies.txt) 경로
+        opts["cookiefile"] = os.environ["IG_COOKIES"]
+    caption = author = transcript = ""
     try:
-        with yt_dlp.YoutubeDL({"quiet": True, "skip_download": True}) as ydl:
-            info = ydl.extract_info(url, download=False)
-        return (info.get("description") or info.get("title") or "", info.get("uploader") or "")
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+        caption = info.get("description") or info.get("title") or ""
+        author = info.get("uploader") or ""
+        files = glob.glob(f"{tmp}/*")
+        if files:
+            if _whisper is None:
+                from faster_whisper import WhisperModel
+                _whisper = WhisperModel(os.environ.get("WHISPER_MODEL", "small"), device="cpu", compute_type="int8")
+            segs, _ = _whisper.transcribe(files[0], vad_filter=True)
+            transcript = " ".join(s.text.strip() for s in segs)
     except Exception as e:
-        print("fetch 오류:", e)
-        return "", ""
+        print("fetch/전사 오류:", e)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return caption, author, transcript
 
 
-def analyze(text):
-    """캡션/메모를 학습 노트(dict)로 정리한다."""
-    if not text.strip():
+def analyze(text, transcript=""):
+    """캡션/메모/영상 전사문을 학습 노트(dict)로 정리한다."""
+    if not (text.strip() or transcript.strip()):
         return dict(EMPTY)
-    prompt = (f"인스타그램 릴스의 캡션/메모입니다.\n---\n{text[:3000]}\n---\n카테고리 목록: {CATEGORIES}\n"
-              "공부용 노트로 정리해 JSON으로만 답하세요:\n"
-              '{"category":"목록 중 하나","title":"20자 내외 제목","summary":"핵심 내용 4~6문장",'
-              '"key_points":["핵심 3~5개"],"steps":["직접 해볼 행동 0~4개"],"tags":["키워드 3~5개"]}\n'
-              "캡션에 없는 내용은 지어내지 말고, 정보가 부족하면 summary에 그렇게 적으세요.")
+    prompt = (f"인스타그램 릴스의 캡션/메모와 음성 전사문입니다(영어 강의일 수 있음).\n[캡션/메모]\n{text[:2000]}\n"
+              f"[전사문]\n{transcript[:12000]}\n---\n카테고리 목록: {CATEGORIES}\n"
+              "한국어 공부 노트로 정리해 JSON으로만 답하세요. 전문용어는 영어 원문을 병기하세요:\n"
+              '{"category":"목록 중 하나","title":"20자 내외 제목","summary":"핵심 내용 6~10문장",'
+              '"key_points":["핵심 3~6개"],"concepts":[{"term":"용어","explain":"초보자용 설명 1~2문장"}],'
+              '"steps":["직접 해볼 행동 0~4개"],"questions":["AI에게 더 물어볼 질문 3개"],"tags":["키워드 3~5개"]}\n'
+              "내용에 없는 것은 지어내지 마세요. 화면으로만 보여준 코드/도식은 전사문에 없으니, 정보가 부족하면 summary에 그렇게 적으세요.")
     try:
-        res = llm.messages.create(model=MODEL, max_tokens=900, messages=[{"role": "user", "content": prompt}])
+        res = llm.messages.create(model=MODEL, max_tokens=2000, messages=[{"role": "user", "content": prompt}])
         data = json.loads(re.search(r"\{.*\}", res.content[0].text, re.S).group())
         if data.get("category") not in CATEGORIES:
             data["category"] = "기타"
@@ -90,13 +112,13 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             continue
         if i:
             await asyncio.sleep(2)  # 연속 요청 차단 방지
-        caption, author = await asyncio.to_thread(fetch_meta, url)
+        caption, author, transcript = await asyncio.to_thread(fetch_reel, url)
         full = f"{caption}\n{memo}".strip()
-        info = await asyncio.to_thread(analyze, full)
-        db_run("INSERT INTO reels (url,author,caption,category,title,summary,details) VALUES (?,?,?,?,?,?,?)",
-               (url, author, full, info["category"], info["title"], info["summary"], json.dumps(info, ensure_ascii=False)))
+        info = await asyncio.to_thread(analyze, full, transcript)
+        db_run("INSERT INTO reels (url,author,caption,transcript,category,title,summary,details) VALUES (?,?,?,?,?,?,?,?)",
+               (url, author, full, transcript, info["category"], info["title"], info["summary"], json.dumps(info, ensure_ascii=False)))
         rid = db_run("SELECT id FROM reels WHERE url=?", (url,), fetch=True)[0]["id"]
-        note = "" if full else f"\n캡션을 못 가져왔어요. /memo {rid} 한 줄 메모"
+        note = "" if (full or transcript) else f"\n내용을 못 가져왔어요. /memo {rid} 한 줄 메모"
         out.append(f"#{rid} [{info['category']}] {info['title']}\n{WEB_BASE}/#/reel/{rid}{note}")
     await update.message.reply_text("\n\n".join(out))
 
@@ -108,12 +130,12 @@ async def cmd_memo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("사용법: /memo 번호 메모내용")
         return
     rid, memo = int(ctx.args[0]), " ".join(ctx.args[1:])
-    rows = db_run("SELECT caption FROM reels WHERE id=?", (rid,), fetch=True)
+    rows = db_run("SELECT caption, transcript FROM reels WHERE id=?", (rid,), fetch=True)
     if not rows:
         await update.message.reply_text("그 번호의 릴스가 없어요.")
         return
     full = f"{rows[0]['caption'] or ''}\n{memo}".strip()
-    info = await asyncio.to_thread(analyze, full)
+    info = await asyncio.to_thread(analyze, full, rows[0]["transcript"] or "")
     db_run("UPDATE reels SET caption=?,category=?,title=?,summary=?,details=? WHERE id=?",
            (full, info["category"], info["title"], info["summary"], json.dumps(info, ensure_ascii=False), rid))
     await update.message.reply_text(f"#{rid} 다시 정리 → [{info['category']}] {info['title']}\n{WEB_BASE}/#/reel/{rid}")
